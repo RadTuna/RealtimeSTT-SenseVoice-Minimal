@@ -453,8 +453,6 @@ When you initialize the `AudioToTextRecorder` class, you have various options to
 
 - **level** (int, default=logging.WARNING): Logging level.
 
-- **batch_size** (int, default=16): Batch size for the main transcription. Set to 0 to deactivate.
-
 - **init_logging** (bool, default=True): Whether to initialize the logging framework. Set to False to manage this yourself.
 
 - **handle_buffer_overflow** (bool, default=True): If set, the system will log a warning when an input overflow occurs during recording and remove the data from the buffer.
@@ -466,8 +464,6 @@ When you initialize the `AudioToTextRecorder` class, you have various options to
 - **suppress_tokens** (list of int, default=[-1]): Tokens to be suppressed from the transcription output.
 
 - **on_recorded_chunk**: A callback function that is triggered when a chunk of audio is recorded. Submits the chunk data as parameter.
-
-- **debug_mode** (bool, default=False): If set, the system prints additional debug information to the console.
 
 - **print_transcription_time** (bool, default=False): Logs the processing time of the main model transcription. This can be useful for performance monitoring and debugging.
 
@@ -493,8 +489,6 @@ When you initialize the `AudioToTextRecorder` class, you have various options to
 - **on_realtime_transcription_update**: A callback function that is triggered whenever there's an update in the real-time transcription. The function is called with the newly transcribed text as its argument.
 
 - **on_realtime_transcription_stabilized**: A callback function that is triggered whenever there's an update in the real-time transcription and returns a higher quality, stabilized text as its argument.
-
-- **realtime_batch_size**: (int, default=16): Batch size for the real-time transcription model. Set to 0 to deactivate.
 
 - **beam_size_realtime** (int, default=3): The beam size to use for real-time transcription beam search decoding.
 

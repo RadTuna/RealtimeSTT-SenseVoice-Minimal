@@ -1,0 +1,4 @@
+assets/warmup_audio.wav filter=lfs diff=lfs merge=lfs -text
+models/sensevoice_small/model_quant.onnx filter=lfs diff=lfs merge=lfs -text
+models/sensevoice_small/chn_jpn_yue_eng_ko_spectok.bpe.model filter=lfs diff=lfs merge=lfs -text
+models/sensevoice_small/am.mvn filter=lfs diff=lfs merge=lfs -text

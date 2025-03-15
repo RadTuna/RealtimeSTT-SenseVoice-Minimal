@@ -3,7 +3,7 @@
 The AudioToTextRecorder class in the provided code facilitates
 fast speech-to-text transcription.
 
-The class employs the faster_whisper library to transcribe the recorded audio
+The class employs the sense voice library to transcribe the recorded audio
 into text using machine learning models, which can be run either on a GPU or
 CPU. Voice activity detection (VAD) is built in, meaning the software can
 automatically start or stop recording based on the presence or absence of
@@ -26,7 +26,9 @@ Author: Kolja Beigel
 
 """
 
-from faster_whisper import WhisperModel, BatchedInferencePipeline
+from funasr_onnx import SenseVoiceSmall
+from funasr_onnx.utils.postprocess_utils import rich_transcription_postprocess
+from silero_vad import load_silero_vad
 from typing import Iterable, List, Optional, Union
 from openwakeword.model import Model
 import torch.multiprocessing as mp
@@ -35,7 +37,6 @@ import signal as system_signal
 from ctypes import c_bool
 from scipy import signal
 import soundfile as sf
-import faster_whisper
 import openwakeword
 import collections
 import numpy as np
@@ -60,8 +61,6 @@ import gc
 # Set OpenMP runtime duplicate library handling to OK (Use only for development!)
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-INIT_MODEL_TRANSCRIPTION = "tiny"
-INIT_MODEL_TRANSCRIPTION_REALTIME = "tiny"
 INIT_REALTIME_PROCESSING_PAUSE = 0.2
 INIT_REALTIME_INITIAL_PAUSE = 0.2
 INIT_SILERO_SENSITIVITY = 0.4
@@ -87,22 +86,13 @@ if platform.system() != 'Darwin':
 
 
 class TranscriptionWorker:
-    def __init__(self, conn, stdout_pipe, model_path, download_root, compute_type, gpu_device_index, device,
-                 ready_event, shutdown_event, interrupt_stop_event, beam_size, initial_prompt, suppress_tokens, batch_size):
+    def __init__(self, conn, stdout_pipe, model_path, ready_event, shutdown_event, interrupt_stop_event):
         self.conn = conn
         self.stdout_pipe = stdout_pipe
         self.model_path = model_path
-        self.download_root = download_root
-        self.compute_type = compute_type
-        self.gpu_device_index = gpu_device_index
-        self.device = device
         self.ready_event = ready_event
         self.shutdown_event = shutdown_event
         self.interrupt_stop_event = interrupt_stop_event
-        self.beam_size = beam_size
-        self.initial_prompt = initial_prompt
-        self.suppress_tokens = suppress_tokens
-        self.batch_size = batch_size
         self.queue = queue.Queue()
 
     def custom_print(self, *args, **kwargs):
@@ -128,34 +118,23 @@ class TranscriptionWorker:
              system_signal.signal(system_signal.SIGINT, system_signal.SIG_IGN)
              __builtins__['print'] = self.custom_print
 
-        logging.info(f"Initializing faster_whisper main transcription model {self.model_path}")
+        logging.info(f"Initializing sense voice main transcription model {self.model_path}")
 
         try:
-            model = faster_whisper.WhisperModel(
-                model_size_or_path=self.model_path,
-                device=self.device,
-                compute_type=self.compute_type,
-                device_index=self.gpu_device_index,
-                download_root=self.download_root,
-            )
-            # Create a short dummy audio array, for example 1 second of silence at 16 kHz
-            if self.batch_size > 0:
-                model = BatchedInferencePipeline(model=model)
+            model = SenseVoiceSmall(self.model_path, batch_size=1, quantize=True)
 
             # Run a warm-up transcription
-            current_dir = os.path.dirname(os.path.realpath(__file__))
-            warmup_audio_path = os.path.join(
-                current_dir, "warmup_audio.wav"
-            )
+            current_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../assets")
+            warmup_audio_path = os.path.join(current_dir, "warmup_audio.wav")
+
             warmup_audio_data, _ = sf.read(warmup_audio_path, dtype="float32")
-            segments, info = model.transcribe(warmup_audio_data, language="en", beam_size=1)
-            model_warmup_transcription = " ".join(segment.text for segment in segments)
+            model(wav_content=warmup_audio_data, language="auto", textnorm="withitn")
         except Exception as e:
-            logging.exception(f"Error initializing main faster_whisper transcription model: {e}")
+            logging.exception(f"Error initializing main sense voice transcription model: {e}")
             raise
 
         self.ready_event.set()
-        logging.debug("Faster_whisper main speech to text transcription model initialized successfully")
+        logging.debug("SenseVoice main speech to text transcription model initialized successfully")
 
         # Start the polling thread
         polling_thread = threading.Thread(target=self.poll_connection)
@@ -167,27 +146,16 @@ class TranscriptionWorker:
                     audio, language = self.queue.get(timeout=0.1)
                     try:
                         logging.debug(f"Transcribing audio with language {language}")
-                        if self.batch_size > 0:
-                            segments, info = model.transcribe(
-                                audio,
-                                language=language if language else None,
-                                beam_size=self.beam_size,
-                                initial_prompt=self.initial_prompt,
-                                suppress_tokens=self.suppress_tokens,
-                                batch_size=self.batch_size
-                            )
-                        else:
-                            segments, info = model.transcribe(
-                                audio,
-                                language=language if language else None,
-                                beam_size=self.beam_size,
-                                initial_prompt=self.initial_prompt,
-                                suppress_tokens=self.suppress_tokens
-                            )
+   
+                        result = model(
+                            audio,
+                            language=language if language else "auto",
+                            textnorm="withitn"
+                        )
 
-                        transcription = " ".join(seg.text for seg in segments).strip()
+                        transcription = " ".join(rich_transcription_postprocess(seg) for seg in result).strip()
                         logging.debug(f"Final text detected with main model: {transcription}")
-                        self.conn.send(('success', (transcription, info)))
+                        self.conn.send(('success', transcription))
                     except Exception as e:
                         logging.error(f"General error in transcription: {e}", exc_info=True)
                         self.conn.send(('error', str(e)))
@@ -217,17 +185,13 @@ class AudioToTextRecorder:
     """
     A class responsible for capturing audio from the microphone, detecting
     voice activity, and then transcribing the captured audio using the
-    `faster_whisper` model.
+    `sensevoice_small` model.
     """
 
     def __init__(self,
-                 model: str = INIT_MODEL_TRANSCRIPTION,
-                 download_root: str = None, 
-                 language: str = "",
-                 compute_type: str = "default",
+                 model_path: str = "",
+                 language: str = "auto",
                  input_device_index: int = None,
-                 gpu_device_index: Union[int, List[int]] = 0,
-                 device: str = "cuda",
                  on_recording_start=None,
                  on_recording_stop=None,
                  on_transcription_start=None,
@@ -236,17 +200,13 @@ class AudioToTextRecorder:
                  use_microphone=True,
                  spinner=True,
                  level=logging.WARNING,
-                 batch_size: int = 16,
 
                  # Realtime transcription parameters
                  enable_realtime_transcription=False,
-                 use_main_model_for_realtime=False,
-                 realtime_model_type=INIT_MODEL_TRANSCRIPTION_REALTIME,
                  realtime_processing_pause=INIT_REALTIME_PROCESSING_PAUSE,
                  init_realtime_after_seconds=INIT_REALTIME_INITIAL_PAUSE,
                  on_realtime_transcription_update=None,
                  on_realtime_transcription_stabilized=None,
-                 realtime_batch_size: int = 16,
 
                  # Voice activation parameters
                  silero_sensitivity: float = INIT_SILERO_SENSITIVITY,
@@ -284,10 +244,7 @@ class AudioToTextRecorder:
                  on_wakeword_detection_start=None,
                  on_wakeword_detection_end=None,
                  on_recorded_chunk=None,
-                 debug_mode=False,
                  handle_buffer_overflow: bool = INIT_HANDLE_BUFFER_OVERFLOW,
-                 beam_size: int = 5,
-                 beam_size_realtime: int = 3,
                  buffer_size: int = BUFFER_SIZE,
                  sample_rate: int = SAMPLE_RATE,
                  initial_prompt: Optional[Union[str, Iterable[int]]] = None,
@@ -297,37 +254,21 @@ class AudioToTextRecorder:
                  early_transcription_on_silence: int = 0,
                  allowed_latency_limit: int = ALLOWED_LATENCY_LIMIT,
                  no_log_file: bool = False,
-                 use_extended_logging: bool = False,
                  ):
         """
         Initializes an audio recorder and  transcription
         and wake word detection.
 
         Args:
-        - model (str, default="tiny"): Specifies the size of the transcription
-            model to use or the path to a converted model directory.
-            Valid options are 'tiny', 'tiny.en', 'base', 'base.en',
-            'small', 'small.en', 'medium', 'medium.en', 'large-v1',
-            'large-v2'.
-            If a specific size is provided, the model is downloaded
-            from the Hugging Face Hub.
-        - download_root (str, default=None): Specifies the root path were the Whisper models 
-          are downloaded to. When empty, the default is used. 
-        - language (str, default=""): Language code for speech-to-text engine.
+        - model_path (str): Path to the SenseVoice model directory.
+            The model should be a pre-downloaded SenseVoice model
+            in ONNX format. The model will be loaded from this path
+            for transcription.
+        - language (str, default="auto"): Language code for speech-to-text engine.
             If not specified, the model will attempt to detect the language
             automatically.
-        - compute_type (str, default="default"): Specifies the type of
-            computation to be used for transcription.
-            See https://opennmt.net/CTranslate2/quantization.html.
         - input_device_index (int, default=0): The index of the audio input
             device to use.
-        - gpu_device_index (int, default=0): Device ID to use.
-            The model can also be loaded on multiple GPUs by passing a list of
-            IDs (e.g. [0, 1, 2, 3]). In that case, multiple transcriptions can
-            run in parallel when transcribe() is called from multiple Python
-            threads
-        - device (str, default="cuda"): Device for model to use. Can either be 
-            "cuda" or "cpu".
         - on_recording_start (callable, default=None): Callback function to be
             called when recording of audio to be transcripted starts.
         - on_recording_stop (callable, default=None): Callback function to be
@@ -351,19 +292,6 @@ class AudioToTextRecorder:
         - enable_realtime_transcription (bool, default=False): Enables or
             disables real-time transcription of audio. When set to True, the
             audio will be transcribed continuously as it is being recorded.
-        - use_main_model_for_realtime (str, default=False):
-            If True, use the main transcription model for both regular and
-            real-time transcription. If False, use a separate model specified
-            by realtime_model_type for real-time transcription.
-            Using a single model can save memory and potentially improve
-            performance, but may not be optimized for real-time processing.
-            Using separate models allows for a smaller, faster model for
-            real-time transcription while keeping a more accurate model for
-            final transcription.
-        - realtime_model_type (str, default="tiny"): Specifies the machine
-            learning model to be used for real-time transcription. Valid
-            options include 'tiny', 'tiny.en', 'base', 'base.en', 'small',
-            'small.en', 'medium', 'medium.en', 'large-v1', 'large-v2'.
         - realtime_processing_pause (float, default=0.1): Specifies the time
             interval in seconds after a chunk of audio gets transcribed. Lower
             values will result in more "real-time" (frequent) transcription
@@ -468,15 +396,9 @@ class AudioToTextRecorder:
         - on_recorded_chunk (callable, default=None): Callback function to be
             called when a chunk of audio is recorded. The function is called
             with the recorded audio chunk as its argument.
-        - debug_mode (bool, default=False): If set to True, the system will
-            print additional debug information to the console.
         - handle_buffer_overflow (bool, default=True): If set to True, the system
             will log a warning when an input overflow occurs during recording and
             remove the data from the buffer.
-        - beam_size (int, default=5): The beam size to use for beam search
-            decoding.
-        - beam_size_realtime (int, default=3): The beam size to use for beam
-            search decoding in the real-time transcription model.
         - buffer_size (int, default=512): The buffer size to use for audio
             recording. Changing this may break functionality.
         - sample_rate (int, default=16000): The sample rate to use for audio
@@ -504,9 +426,6 @@ class AudioToTextRecorder:
         - allowed_latency_limit (int, default=100): Maximal amount of chunks
             that can be unprocessed in queue before discarding chunks.
         - no_log_file (bool, default=False): Skips writing of debug log file.
-        - use_extended_logging (bool, default=False): Writes extensive
-            log messages for the recording worker, that processes the audio
-            chunks.
 
         Raises:
             Exception: Errors related to initializing transcription
@@ -514,10 +433,7 @@ class AudioToTextRecorder:
         """
 
         self.language = language
-        self.compute_type = compute_type
         self.input_device_index = input_device_index
-        self.gpu_device_index = gpu_device_index
-        self.device = device
         self.wake_words = wake_words
         self.wake_word_activation_delay = wake_word_activation_delay
         self.wake_word_timeout = wake_word_timeout
@@ -544,12 +460,8 @@ class AudioToTextRecorder:
         self.on_recorded_chunk = on_recorded_chunk
         self.on_transcription_start = on_transcription_start
         self.enable_realtime_transcription = enable_realtime_transcription
-        self.use_main_model_for_realtime = use_main_model_for_realtime
-        self.main_model_type = model
-        if not download_root:
-            download_root = None
-        self.download_root = download_root
-        self.realtime_model_type = realtime_model_type
+        self.model_path = model_path
+
         self.realtime_processing_pause = realtime_processing_pause
         self.init_realtime_after_seconds = init_realtime_after_seconds
         self.on_realtime_transcription_update = (
@@ -558,13 +470,8 @@ class AudioToTextRecorder:
         self.on_realtime_transcription_stabilized = (
             on_realtime_transcription_stabilized
         )
-        self.debug_mode = debug_mode
         self.handle_buffer_overflow = handle_buffer_overflow
-        self.beam_size = beam_size
-        self.beam_size_realtime = beam_size_realtime
         self.allowed_latency_limit = allowed_latency_limit
-        self.batch_size = batch_size
-        self.realtime_batch_size = realtime_batch_size
 
         self.level = level
         self.audio_queue = mp.Queue()
@@ -605,16 +512,11 @@ class AudioToTextRecorder:
         self.initial_prompt_realtime = initial_prompt_realtime
         self.suppress_tokens = suppress_tokens
         self.use_wake_words = wake_words or wakeword_backend in {'oww', 'openwakeword', 'openwakewords'}
-        self.detected_language = None
-        self.detected_language_probability = 0
-        self.detected_realtime_language = None
-        self.detected_realtime_language_probability = 0
         self.transcription_lock = threading.Lock()
         self.shutdown_lock = threading.Lock()
         self.transcribe_count = 0
         self.print_transcription_time = print_transcription_time
         self.early_transcription_on_silence = early_transcription_on_silence
-        self.use_extended_logging = use_extended_logging
 
         # Initialize the logging configuration with the specified level
         log_format = 'RealTimeSTT: %(name)s - %(levelname)s - %(message)s'
@@ -659,37 +561,21 @@ class AudioToTextRecorder:
 
         logging.info("Starting RealTimeSTT")
 
-        if use_extended_logging:
-            logging.info("RealtimeSTT was called with these parameters:")
-            for param, value in locals().items():
-                logging.info(f"{param}: {value}")
-
         self.interrupt_stop_event = mp.Event()
         self.was_interrupted = mp.Event()
         self.main_transcription_ready_event = mp.Event()
         self.parent_transcription_pipe, child_transcription_pipe = mp.Pipe()
         self.parent_stdout_pipe, child_stdout_pipe = mp.Pipe()
 
-        # Set device for model
-        self.device = "cuda" if self.device == "cuda" and torch.cuda.is_available() else "cpu"
-
         self.transcript_process = self._start_thread(
             target=AudioToTextRecorder._transcription_worker,
             args=(
                 child_transcription_pipe,
                 child_stdout_pipe,
-                self.main_model_type,
-                self.download_root,
-                self.compute_type,
-                self.gpu_device_index,
-                self.device,
+                self.model_path,
                 self.main_transcription_ready_event,
                 self.shutdown_event,
                 self.interrupt_stop_event,
-                self.beam_size,
-                self.initial_prompt,
-                self.suppress_tokens,
-                self.batch_size
             )
         )
 
@@ -712,43 +598,6 @@ class AudioToTextRecorder:
                     self.use_microphone
                 )
             )
-
-        # Initialize the realtime transcription model
-        if self.enable_realtime_transcription and not self.use_main_model_for_realtime:
-            try:
-                logging.info("Initializing faster_whisper realtime "
-                             f"transcription model {self.realtime_model_type}, "
-                             f"default device: {self.device}, "
-                             f"compute type: {self.compute_type}, "
-                             f"device index: {self.gpu_device_index}, "
-                             f"download root: {self.download_root}"
-                             )
-                self.realtime_model_type = faster_whisper.WhisperModel(
-                    model_size_or_path=self.realtime_model_type,
-                    device=self.device,
-                    compute_type=self.compute_type,
-                    device_index=self.gpu_device_index,
-                    download_root=self.download_root,
-                )
-                if self.realtime_batch_size > 0:
-                    self.realtime_model_type = BatchedInferencePipeline(model=self.realtime_model_type)
-
-                # Run a warm-up transcription
-                current_dir = os.path.dirname(os.path.realpath(__file__))
-                warmup_audio_path = os.path.join(
-                    current_dir, "warmup_audio.wav"
-                )
-                warmup_audio_data, _ = sf.read(warmup_audio_path, dtype="float32")
-                segments, info = self.realtime_model_type.transcribe(warmup_audio_data, language="en", beam_size=1)
-                model_warmup_transcription = " ".join(segment.text for segment in segments)
-            except Exception as e:
-                logging.exception("Error initializing faster_whisper "
-                                  f"realtime transcription model: {e}"
-                                  )
-                raise
-
-            logging.debug("Faster_whisper realtime speech to text "
-                          "transcription model initialized successfully")
 
         # Setup wake word detection
         if wake_words or wakeword_backend in {'oww', 'openwakeword', 'openwakewords'}:
@@ -850,12 +699,7 @@ class AudioToTextRecorder:
 
         # Setup voice activity detection model Silero VAD
         try:
-            self.silero_vad_model, _ = torch.hub.load(
-                repo_or_dir="snakers4/silero-vad",
-                model="silero_vad",
-                verbose=False,
-                onnx=silero_use_onnx
-            )
+            self.silero_vad_model = load_silero_vad(onnx=True)
 
         except Exception as e:
             logging.exception(f"Error initializing Silero VAD "
@@ -1287,7 +1131,6 @@ class AudioToTextRecorder:
         if self.is_recording: # if recording, make sure to stop the recorder
             self.stop()
 
-
     def wait_audio(self):
         """
         Waits for the start and completion of the audio recording process.
@@ -1396,7 +1239,7 @@ class AudioToTextRecorder:
     def transcribe(self):
         """
         Transcribes audio captured by this class instance using the
-        `faster_whisper` model.
+        `sensevoice_small` model.
 
         Automatically starts recording upon voice activity if not manually
           started using `recorder.start()`.
@@ -1444,20 +1287,17 @@ class AudioToTextRecorder:
                 self.allowed_to_early_transcribe = True
                 self._set_state("inactive")
                 if status == 'success':
-                    segments, info = result
-                    self.detected_language = info.language if info.language_probability > 0 else None
-                    self.detected_language_probability = info.language_probability
                     self.last_transcription_bytes = copy.deepcopy(audio_copy)                    
                     self.last_transcription_bytes_b64 = base64.b64encode(self.last_transcription_bytes.tobytes()).decode('utf-8')
-                    transcription = self._preprocess_output(segments)
+                    transcription = self._preprocess_output(result)
                     end_time = time.time()  # End timing
                     transcription_time = end_time - start_time
 
                     if start_time:
                         if self.print_transcription_time:
-                            print(f"Model {self.main_model_type} completed transcription in {transcription_time:.2f} seconds")
+                            print(f"Model {self.model_path} completed transcription in {transcription_time:.2f} seconds")
                         else:
-                            logging.debug(f"Model {self.main_model_type} completed transcription in {transcription_time:.2f} seconds")
+                            logging.debug(f"Model {self.model_path} completed transcription in {transcription_time:.2f} seconds")
                     return "" if self.interrupt_stop_event.is_set() else transcription # if interrupted return empty string
                 else:
                     logging.error(f"Transcription error: {result}")
@@ -1476,8 +1316,6 @@ class AudioToTextRecorder:
                 data
             )
             porcupine_index = self.porcupine.process(pcm)
-            if self.debug_mode:
-                logging.info(f"wake words porcupine_index: {porcupine_index}")
             return porcupine_index
 
         elif self.wakeword_backend in {'oww', 'openwakeword', 'openwakewords'}:
@@ -1486,23 +1324,15 @@ class AudioToTextRecorder:
             max_score = -1
             max_index = -1
             wake_words_in_prediction = len(self.owwModel.prediction_buffer.keys())
-            self.wake_words_sensitivities
             if wake_words_in_prediction:
                 for idx, mdl in enumerate(self.owwModel.prediction_buffer.keys()):
                     scores = list(self.owwModel.prediction_buffer[mdl])
                     if scores[-1] >= self.wake_words_sensitivity and scores[-1] > max_score:
                         max_score = scores[-1]
                         max_index = idx
-                if self.debug_mode:
-                    logging.info(f"wake words oww max_index, max_score: {max_index} {max_score}")
                 return max_index  
             else:
-                if self.debug_mode:
-                    logging.info(f"wake words oww_index: -1")
                 return -1
-
-        if self.debug_mode:        
-            logging.info("wake words no match")
 
         return -1
 
@@ -1511,7 +1341,7 @@ class AudioToTextRecorder:
              ):
         """
         Transcribes audio captured by this class instance
-        using the `faster_whisper` model.
+        using the `sensevoice_small` model.
 
         - Automatically starts recording upon voice activity if not manually
           started using `recorder.start()`.
@@ -1550,7 +1380,6 @@ class AudioToTextRecorder:
         else:
             return self.transcribe()
 
-
     def format_number(self, num):
         # Convert the number to a string
         num_str = f"{num:.10f}"  # Ensure precision is sufficient
@@ -1577,8 +1406,6 @@ class AudioToTextRecorder:
         logging.info("recording started")
         self._set_state("recording")
         self.text_storage = []
-        self.realtime_stabilized_text = ""
-        self.realtime_stabilized_safetext = ""
         self.wakeword_detected = False
         self.wake_word_detect_time = 0
         self.frames = []
@@ -1751,10 +1578,6 @@ class AudioToTextRecorder:
             if self.realtime_thread:
                 self.realtime_thread.join()
 
-            if self.enable_realtime_transcription:
-                if self.realtime_model_type:
-                    del self.realtime_model_type
-                    self.realtime_model_type = None
             gc.collect()
 
     def _recording_worker(self):
@@ -1763,13 +1586,7 @@ class AudioToTextRecorder:
         input for voice activity and accordingly starts/stops the recording.
         """
 
-        if self.use_extended_logging:
-            logging.debug('Debug: Entering try block')
-
-        last_inner_try_time = 0
         try:
-            if self.use_extended_logging:
-                logging.debug('Debug: Initializing variables')
             time_since_last_buffer_message = 0
             was_recording = False
             delay_was_passed = False
@@ -1777,64 +1594,30 @@ class AudioToTextRecorder:
             wakeword_samples_to_remove = None
             self.allowed_to_early_transcribe = True
 
-            if self.use_extended_logging:
-                logging.debug('Debug: Starting main loop')
             # Continuously monitor audio for voice activity
             while self.is_running:
-
-                # if self.use_extended_logging:
-                #     logging.debug('Debug: Entering inner try block')
-                if last_inner_try_time:
-                    last_processing_time = time.time() - last_inner_try_time
-                    if last_processing_time > 0.1:
-                        if self.use_extended_logging:
-                            logging.warning('### WARNING: PROCESSING TOOK TOO LONG')
-                last_inner_try_time = time.time()
                 try:
-                    # if self.use_extended_logging:
-                    #     logging.debug('Debug: Trying to get data from audio queue')
                     try:
                         data = self.audio_queue.get(timeout=0.01)
                         self.last_words_buffer.append(data)
                     except queue.Empty:
-                        # if self.use_extended_logging:
-                        #     logging.debug('Debug: Queue is empty, checking if still running')
                         if not self.is_running:
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Not running, breaking loop')
                             break
-                        # if self.use_extended_logging:
-                        #     logging.debug('Debug: Continuing to next iteration')
                         continue
 
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Checking for on_recorded_chunk callback')
                     if self.on_recorded_chunk:
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Calling on_recorded_chunk')
                         self.on_recorded_chunk(data)
 
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Checking if handle_buffer_overflow is True')
                     if self.handle_buffer_overflow:
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Handling buffer overflow')
                         # Handle queue overflow
-                        if (self.audio_queue.qsize() >
-                                self.allowed_latency_limit):
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Queue size exceeds limit, logging warnings')
+                        if (self.audio_queue.qsize() > self.allowed_latency_limit):
                             logging.warning("Audio queue size exceeds "
                                             "latency limit. Current size: "
                                             f"{self.audio_queue.qsize()}. "
                                             "Discarding old audio chunks."
                                             )
 
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Discarding old chunks if necessary')
-                        while (self.audio_queue.qsize() >
-                                self.allowed_latency_limit):
-
+                        while (self.audio_queue.qsize() > self.allowed_latency_limit):
                             data = self.audio_queue.get()
 
                 except BrokenPipeError:
@@ -1842,27 +1625,17 @@ class AudioToTextRecorder:
                     self.is_running = False
                     break
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Updating time_since_last_buffer_message')
                 # Feed the extracted data to the audio_queue
                 if time_since_last_buffer_message:
                     time_passed = time.time() - time_since_last_buffer_message
                     if time_passed > 1:
-                        if self.use_extended_logging:
-                            logging.debug("_recording_worker processing audio data")
                         time_since_last_buffer_message = time.time()
                 else:
                     time_since_last_buffer_message = time.time()
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Initializing failed_stop_attempt')
                 failed_stop_attempt = False
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Checking if not recording')
                 if not self.is_recording:
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Handling not recording state')
                     # Handle not recording state
                     time_since_listen_start = (time.time() - self.listen_start
                                             if self.listen_start else 0)
@@ -1872,45 +1645,29 @@ class AudioToTextRecorder:
                         self.wake_word_activation_delay
                     )
 
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Handling wake-word timeout callback')
                     # Handle wake-word timeout callback
                     if wake_word_activation_delay_passed \
                             and not delay_was_passed:
 
                         if self.use_wake_words and self.wake_word_activation_delay:
                             if self.on_wakeword_timeout:
-                                if self.use_extended_logging:
-                                    logging.debug('Debug: Calling on_wakeword_timeout')
                                 self.on_wakeword_timeout()
                     delay_was_passed = wake_word_activation_delay_passed
 
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Setting state and spinner text')
                     # Set state and spinner text
                     if not self.recording_stop_time:
                         if self.use_wake_words \
                                 and wake_word_activation_delay_passed \
                                 and not self.wakeword_detected:
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Setting state to "wakeword"')
                             self._set_state("wakeword")
                         else:
                             if self.listen_start:
-                                if self.use_extended_logging:
-                                    logging.debug('Debug: Setting state to "listening"')
                                 self._set_state("listening")
                             else:
-                                if self.use_extended_logging:
-                                    logging.debug('Debug: Setting state to "inactive"')
                                 self._set_state("inactive")
 
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Checking wake word conditions')
                     if self.use_wake_words and wake_word_activation_delay_passed:
                         try:
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Processing wakeword')
                             wakeword_index = self._process_wakeword(data)
 
                         except struct.error:
@@ -1922,23 +1679,15 @@ class AudioToTextRecorder:
                             logging.error(f"Wake word processing error: {e}", exc_info=True)
                             continue
 
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Checking if wake word detected')
                         # If a wake word is detected                        
                         if wakeword_index >= 0:
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Wake word detected, updating variables')
                             self.wake_word_detect_time = time.time()
                             wakeword_detected_time = time.time()
                             wakeword_samples_to_remove = int(self.sample_rate * self.wake_word_buffer_duration)
                             self.wakeword_detected = True
                             if self.on_wakeword_detected:
-                                if self.use_extended_logging:
-                                    logging.debug('Debug: Calling on_wakeword_detected')
                                 self.on_wakeword_detected()
 
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Checking voice activity conditions')
                     # Check for voice activity to
                     # trigger the start of recording
                     if ((not self.use_wake_words
@@ -1946,46 +1695,26 @@ class AudioToTextRecorder:
                             and self.start_recording_on_voice_activity) \
                             or self.wakeword_detected:
 
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Checking if voice is active')
                         if self._is_voice_active():
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Voice activity detected')
                             logging.info("voice activity detected")
-
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Starting recording')
+                            
                             self.start()
-
                             self.start_recording_on_voice_activity = False
 
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Adding buffered audio to frames')
                             # Add the buffered audio
                             # to the recording frames
                             self.frames.extend(list(self.audio_buffer))
                             self.audio_buffer.clear()
-
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Resetting Silero VAD model states')
                             self.silero_vad_model.reset_states()
                         else:
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Checking voice activity')
                             data_copy = data[:]
                             self._check_voice_activity(data_copy)
 
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Resetting speech_end_silence_start')
                     self.speech_end_silence_start = 0
 
                 else:
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Handling recording state')
                     # If we are currently recording
                     if wakeword_samples_to_remove and wakeword_samples_to_remove > 0:
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Removing wakeword samples')
                         # Remove samples from the beginning of self.frames
                         samples_removed = 0
                         while wakeword_samples_to_remove > 0 and self.frames:
@@ -2002,31 +1731,19 @@ class AudioToTextRecorder:
                         
                         wakeword_samples_to_remove = 0
 
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Checking if stop_recording_on_voice_deactivity is True')
                     # Stop the recording if silence is detected after speech
                     if self.stop_recording_on_voice_deactivity:
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Determining if speech is detected')
                         is_speech = (
                             self._is_silero_speech(data) if self.silero_deactivity_detection
                             else self._is_webrtc_speech(data, True)
                         )
 
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Formatting speech_end_silence_start')
                         if not self.speech_end_silence_start:
                             str_speech_end_silence_start = "0"
                         else:
                             str_speech_end_silence_start = datetime.datetime.fromtimestamp(self.speech_end_silence_start).strftime('%H:%M:%S.%f')[:-3]
-                        if self.use_extended_logging:
-                            logging.debug(f"is_speech: {is_speech}, str_speech_end_silence_start: {str_speech_end_silence_start}")
 
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Checking if speech is not detected')
                         if not is_speech:
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Handling voice deactivity')
                             # Voice deactivity was detected, so we start
                             # measuring silence time before stopping recording
                             if self.speech_end_silence_start == 0 and \
@@ -2034,85 +1751,45 @@ class AudioToTextRecorder:
 
                                 self.speech_end_silence_start = time.time()
 
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Checking early transcription conditions')
                             if self.speech_end_silence_start and self.early_transcription_on_silence and len(self.frames) > 0 and \
                                 (time.time() - self.speech_end_silence_start > self.early_transcription_on_silence) and \
                                 self.allowed_to_early_transcribe:
-                                    if self.use_extended_logging:
-                                        logging.debug("Debug:Adding early transcription request")
                                     self.transcribe_count += 1
                                     audio_array = np.frombuffer(b''.join(self.frames), dtype=np.int16)
                                     audio = audio_array.astype(np.float32) / INT16_MAX_ABS_VALUE
-
-                                    if self.use_extended_logging:
-                                        logging.debug("Debug: early transcription request pipe send")
                                     self.parent_transcription_pipe.send((audio, self.language))
-                                    if self.use_extended_logging:
-                                        logging.debug("Debug: early transcription request pipe send return")
                                     self.allowed_to_early_transcribe = False
 
                         else:
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Handling speech detection')
                             if self.speech_end_silence_start:
-                                if self.use_extended_logging:
-                                    logging.info("Resetting self.speech_end_silence_start")
                                 self.speech_end_silence_start = 0
                                 self.allowed_to_early_transcribe = True
 
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Checking if silence duration exceeds threshold')
                         # Wait for silence to stop recording after speech
                         if self.speech_end_silence_start and time.time() - \
                                 self.speech_end_silence_start >= \
                                 self.post_speech_silence_duration:
 
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Formatting silence start time')
                             # Get time in desired format (HH:MM:SS.nnn)
                             silence_start_time = datetime.datetime.fromtimestamp(self.speech_end_silence_start).strftime('%H:%M:%S.%f')[:-3]
 
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Calculating time difference')
                             # Calculate time difference
                             time_diff = time.time() - self.speech_end_silence_start
 
-                            if self.use_extended_logging:
-                                logging.debug('Debug: Logging voice deactivity detection')
-                                logging.info(f"voice deactivity detected at {silence_start_time}, "
-                                        f"time since silence start: {time_diff:.3f} seconds")
-
-                                logging.debug('Debug: Appending data to frames and stopping recording')
                             self.frames.append(data)
                             self.stop()
                             if not self.is_recording:
-                                if self.use_extended_logging:
-                                    logging.debug('Debug: Resetting speech_end_silence_start')
                                 self.speech_end_silence_start = 0
-
-                                if self.use_extended_logging:
-                                    logging.debug('Debug: Handling non-wake word scenario')
                             else:
-                                if self.use_extended_logging:
-                                    logging.debug('Debug: Setting failed_stop_attempt to True')
                                 failed_stop_attempt = True
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Checking if recording stopped')
                 if not self.is_recording and was_recording:
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Resetting after stopping recording')
                     # Reset after stopping recording to ensure clean state
                     self.stop_recording_on_voice_deactivity = False
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Checking Silero time')
                 if time.time() - self.silero_check_time > 0.1:
                     self.silero_check_time = 0
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Handling wake word timeout')
                 # Handle wake word timeout (waited to long initiating
                 # speech after wake word detection)
                 if self.wake_word_detect_time and time.time() - \
@@ -2120,38 +1797,21 @@ class AudioToTextRecorder:
 
                     self.wake_word_detect_time = 0
                     if self.wakeword_detected and self.on_wakeword_timeout:
-                        if self.use_extended_logging:
-                            logging.debug('Debug: Calling on_wakeword_timeout')
                         self.on_wakeword_timeout()
                     self.wakeword_detected = False
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Updating was_recording')
                 was_recording = self.is_recording
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Checking if recording and not failed stop attempt')
                 if self.is_recording and not failed_stop_attempt:
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Appending data to frames')
                     self.frames.append(data)
 
-                if self.use_extended_logging:
-                    logging.debug('Debug: Checking if not recording or speech end silence start')
                 if not self.is_recording or self.speech_end_silence_start:
-                    if self.use_extended_logging:
-                        logging.debug('Debug: Appending data to audio buffer')
                     self.audio_buffer.append(data)
 
         except Exception as e:
-            logging.debug('Debug: Caught exception in main try block')
             if not self.interrupt_stop_event.is_set():
                 logging.error(f"Unhandled exeption in _recording_worker: {e}", exc_info=True)
                 raise
-
-        if self.use_extended_logging:
-            logging.debug('Debug: Exiting _recording_worker method')
-
 
     def _realtime_worker(self):
         """
@@ -2193,54 +1853,24 @@ class AudioToTextRecorder:
                     audio_array = audio_array.astype(np.float32) / \
                         INT16_MAX_ABS_VALUE
 
-                    if self.use_main_model_for_realtime:
-                        with self.transcription_lock:
-                            try:
-                                self.parent_transcription_pipe.send((audio_array, self.language))
-                                if self.parent_transcription_pipe.poll(timeout=5):  # Wait for 5 seconds
-                                    logging.debug("Receive from realtime worker after transcription request to main model")
-                                    status, result = self.parent_transcription_pipe.recv()
-                                    if status == 'success':
-                                        segments, info = result
-                                        self.detected_realtime_language = info.language if info.language_probability > 0 else None
-                                        self.detected_realtime_language_probability = info.language_probability
-                                        realtime_text = segments
-                                        logging.debug(f"Realtime text detected with main model: {realtime_text}")
-                                    else:
-                                        logging.error(f"Realtime transcription error: {result}")
-                                        continue
+                    with self.transcription_lock:
+                        try:
+                            self.parent_transcription_pipe.send((audio_array, self.language))
+                            if self.parent_transcription_pipe.poll(timeout=5):  # Wait for 5 seconds
+                                logging.debug("Receive from realtime worker after transcription request to main model")
+                                status, result = self.parent_transcription_pipe.recv()
+                                if status == 'success':
+                                    realtime_text = result
+                                    logging.debug(f"Realtime text detected with main model: {realtime_text}")
                                 else:
-                                    logging.warning("Realtime transcription timed out")
+                                    logging.error(f"Realtime transcription error: {result}")
                                     continue
-                            except Exception as e:
-                                logging.error(f"Error in realtime transcription: {str(e)}", exc_info=True)
+                            else:
+                                logging.warning("Realtime transcription timed out")
                                 continue
-                    else:
-                        # Perform transcription and assemble the text
-                        if self.realtime_batch_size > 0:
-                            segments, info = self.realtime_model_type.transcribe(
-                                audio_array,
-                                language=self.language if self.language else None,
-                                beam_size=self.beam_size_realtime,
-                                initial_prompt=self.initial_prompt_realtime,
-                                suppress_tokens=self.suppress_tokens,
-                                batch_size=self.realtime_batch_size
-                            )
-                        else:
-                            segments, info = self.realtime_model_type.transcribe(
-                                audio_array,
-                                language=self.language if self.language else None,
-                                beam_size=self.beam_size_realtime,
-                                initial_prompt=self.initial_prompt_realtime,
-                                suppress_tokens=self.suppress_tokens
-                            )
-
-                        self.detected_realtime_language = info.language if info.language_probability > 0 else None
-                        self.detected_realtime_language_probability = info.language_probability
-                        realtime_text = " ".join(
-                            seg.text for seg in segments
-                        )
-                        logging.debug(f"Realtime text detected: {realtime_text}")
+                        except Exception as e:
+                            logging.error(f"Error in realtime transcription: {str(e)}", exc_info=True)
+                            continue
 
                     # double check recording state
                     # because it could have changed mid-transcription
@@ -2350,11 +1980,6 @@ class AudioToTextRecorder:
             torch.from_numpy(audio_chunk),
             SAMPLE_RATE).item()
         is_silero_speech_active = vad_prob > (1 - self.silero_sensitivity)
-        if is_silero_speech_active:
-            if not self.is_silero_speech_active and self.use_extended_logging:
-                logging.info(f"{bcolors.OKGREEN}Silero VAD detected speech{bcolors.ENDC}")
-        elif self.is_silero_speech_active and self.use_extended_logging:
-            logging.info(f"{bcolors.WARNING}Silero VAD detected silence{bcolors.ENDC}")
         self.is_silero_speech_active = is_silero_speech_active
         self.silero_working = False
         return is_silero_speech_active
@@ -2387,31 +2012,13 @@ class AudioToTextRecorder:
             if self.webrtc_vad_model.is_speech(frame, 16000):
                 speech_frames += 1
                 if not all_frames_must_be_true:
-                    if self.debug_mode:
-                        logging.info(f"Speech detected in frame {i + 1}"
-                              f" of {num_frames}")
-                    if not self.is_webrtc_speech_active and self.use_extended_logging:
-                        logging.info(speech_str)
                     self.is_webrtc_speech_active = True
                     return True
         if all_frames_must_be_true:
-            if self.debug_mode and speech_frames == num_frames:
-                logging.info(f"Speech detected in {speech_frames} of "
-                      f"{num_frames} frames")
-            elif self.debug_mode:
-                logging.info(f"Speech not detected in all {num_frames} frames")
             speech_detected = speech_frames == num_frames
-            if speech_detected and not self.is_webrtc_speech_active and self.use_extended_logging:
-                logging.info(speech_str)
-            elif not speech_detected and self.is_webrtc_speech_active and self.use_extended_logging:
-                logging.info(silence_str)
             self.is_webrtc_speech_active = speech_detected
             return speech_detected
         else:
-            if self.debug_mode:
-                logging.info(f"Speech not detected in any of {num_frames} frames")
-            if self.is_webrtc_speech_active and self.use_extended_logging:
-                logging.info(silence_str)
             self.is_webrtc_speech_active = False
             return False
 

@@ -1,3 +1,4 @@
+
 from colorama import init, Fore, Style
 from scipy.signal import butter, filtfilt, resample_poly
 import pyaudio
@@ -12,7 +13,6 @@ class AudioInput:
     def __init__(
             self,
             input_device_index: int = None,
-            debug_mode: bool = False,
             target_samplerate: int = DESIRED_RATE,
             chunk_size: int = CHUNK_SIZE,
             audio_format: int = AUDIO_FORMAT,
@@ -21,7 +21,6 @@ class AudioInput:
         ):
 
         self.input_device_index = input_device_index
-        self.debug_mode = debug_mode
         self.audio_interface = None
         self.stream = None
         self.device_sample_rate = None
@@ -113,18 +112,11 @@ class AudioInput:
         try:
             self.audio_interface = pyaudio.PyAudio()
 
-            if self.debug_mode:
-                print(f"Input device index: {self.input_device_index}")
             actual_device_index = (self.input_device_index if self.input_device_index is not None 
                                 else self.audio_interface.get_default_input_device_info()['index'])
             
-            if self.debug_mode:
-                print(f"Actual selected device index: {actual_device_index}")
             self.input_device_index = actual_device_index
             self.device_sample_rate = self._get_best_sample_rate(actual_device_index, self.target_samplerate)
-
-            if self.debug_mode:
-                print(f"Setting up audio on device {self.input_device_index} with sample rate {self.device_sample_rate}")
 
             try:
                 self.stream = self.audio_interface.open(
@@ -135,8 +127,6 @@ class AudioInput:
                     frames_per_buffer=self.chunk_size,
                     input_device_index=self.input_device_index,
                 )
-                if self.debug_mode:
-                    print(f"Audio recording initialized successfully at {self.device_sample_rate} Hz")
                 return True
             except Exception as e:
                 print(f"Failed to initialize audio stream at {self.device_sample_rate} Hz: {e}")
