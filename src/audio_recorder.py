@@ -1214,6 +1214,7 @@ class AudioToTextRecorder:
                 if self.transcribe_count == 0:
                     logging.debug("Adding transcription request, no early transcription started")
                     start_time = time.time()  # Start timing
+                    audio_copy = self._add_padding_to_audio(audio_copy)
                     self.parent_transcription_pipe.send((audio_copy, self.language))
                     self.transcribe_count += 1
 
@@ -1697,6 +1698,7 @@ class AudioToTextRecorder:
                                     self.transcribe_count += 1
                                     audio_array = np.frombuffer(b''.join(self.frames), dtype=np.int16)
                                     audio = audio_array.astype(np.float32) / INT16_MAX_ABS_VALUE
+                                    audio = self._add_padding_to_audio(audio)
                                     self.parent_transcription_pipe.send((audio, self.language))
                                     self.allowed_to_early_transcribe = False
 
@@ -2005,6 +2007,18 @@ class AudioToTextRecorder:
                 return len(text2) - i
 
         return -1
+
+    def _add_padding_to_audio(self, audio, padding_duration=1.0):
+        """
+        Adds silence padding to the beginning and end of the audio data to improve ASR model performance.
+
+        Args:
+            audio (bytes): The audio data to be padded.
+            padding_duration (float): The duration of the padding to be added.
+        """
+        padding = np.zeros(int(self.sample_rate * padding_duration), dtype=np.float32)
+        audio = np.concatenate([padding, audio, padding])
+        return audio
 
     def __enter__(self):
         """
