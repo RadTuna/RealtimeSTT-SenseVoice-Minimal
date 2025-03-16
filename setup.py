@@ -12,6 +12,6 @@ setup(
     name="RealtimeSTT",
     version="0.1",
     packages=find_packages(where="RealtimeSTT"),
-    package_dir={"": "RealtimeSTT"},
+    package_dir={"RealtimeSTT": "RealtimeSTT"},
     install_requires=requirements,
 )
