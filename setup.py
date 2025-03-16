@@ -11,7 +11,7 @@ with open(req_path, "r", encoding="utf-8") as f:
 setup(
     name="RealtimeSTT",
     version="0.1",
-    packages=find_packages(where="RealtimeSTT"),
+    packages=find_packages(),
     package_dir={"RealtimeSTT": "RealtimeSTT"},
     install_requires=requirements,
 )
