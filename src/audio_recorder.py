@@ -201,13 +201,6 @@ class AudioToTextRecorder:
                  spinner=True,
                  level=logging.WARNING,
 
-                 # Realtime transcription parameters
-                 enable_realtime_transcription=False,
-                 realtime_processing_pause=INIT_REALTIME_PROCESSING_PAUSE,
-                 init_realtime_after_seconds=INIT_REALTIME_INITIAL_PAUSE,
-                 on_realtime_transcription_update=None,
-                 on_realtime_transcription_stabilized=None,
-
                  # Voice activation parameters
                  silero_sensitivity: float = INIT_SILERO_SENSITIVITY,
                  silero_use_onnx: bool = False,
@@ -247,9 +240,6 @@ class AudioToTextRecorder:
                  handle_buffer_overflow: bool = INIT_HANDLE_BUFFER_OVERFLOW,
                  buffer_size: int = BUFFER_SIZE,
                  sample_rate: int = SAMPLE_RATE,
-                 initial_prompt: Optional[Union[str, Iterable[int]]] = None,
-                 initial_prompt_realtime: Optional[Union[str, Iterable[int]]] = None,
-                 suppress_tokens: Optional[List[int]] = [-1],
                  print_transcription_time: bool = False,
                  early_transcription_on_silence: int = 0,
                  allowed_latency_limit: int = ALLOWED_LATENCY_LIMIT,
@@ -288,27 +278,6 @@ class AudioToTextRecorder:
         - spinner (bool, default=True): Show spinner animation with current
             state.
         - level (int, default=logging.WARNING): Logging level.
-        - batch_size (int, default=16): Batch size for the main transcription
-        - enable_realtime_transcription (bool, default=False): Enables or
-            disables real-time transcription of audio. When set to True, the
-            audio will be transcribed continuously as it is being recorded.
-        - realtime_processing_pause (float, default=0.1): Specifies the time
-            interval in seconds after a chunk of audio gets transcribed. Lower
-            values will result in more "real-time" (frequent) transcription
-            updates but may increase computational load.
-        - init_realtime_after_seconds (float, default=0.2): Specifies the 
-            initial waiting time after the recording was initiated before
-            yielding the first realtime transcription
-        - on_realtime_transcription_update = A callback function that is
-            triggered whenever there's an update in the real-time
-            transcription. The function is called with the newly transcribed
-            text as its argument.
-        - on_realtime_transcription_stabilized = A callback function that is
-            triggered when the transcribed text stabilizes in quality. The
-            stabilized text is generally more accurate but may arrive with a
-            slight delay compared to the regular real-time updates.
-        - realtime_batch_size (int, default=16): Batch size for the real-time
-            transcription model.
         - silero_sensitivity (float, default=SILERO_SENSITIVITY): Sensitivity
             for the Silero Voice Activity Detection model ranging from 0
             (least sensitive) to 1 (most sensitive). Default is 0.5.
@@ -404,10 +373,6 @@ class AudioToTextRecorder:
         - sample_rate (int, default=16000): The sample rate to use for audio
             recording. Changing this will very probably functionality (as the
             WebRTC VAD model is very sensitive towards the sample rate).
-        - initial_prompt (str or iterable of int, default=None): Initial
-            prompt to be fed to the main transcription model.
-        - initial_prompt_realtime (str or iterable of int, default=None):
-            Initial prompt to be fed to the real-time transcription model.
         - suppress_tokens (list of int, default=[-1]): Tokens to be suppressed
             from the transcription output.
         - print_transcription_time (bool, default=False): Logs processing time
@@ -459,17 +424,8 @@ class AudioToTextRecorder:
         self.on_wakeword_detection_end = on_wakeword_detection_end
         self.on_recorded_chunk = on_recorded_chunk
         self.on_transcription_start = on_transcription_start
-        self.enable_realtime_transcription = enable_realtime_transcription
         self.model_path = model_path
 
-        self.realtime_processing_pause = realtime_processing_pause
-        self.init_realtime_after_seconds = init_realtime_after_seconds
-        self.on_realtime_transcription_update = (
-            on_realtime_transcription_update
-        )
-        self.on_realtime_transcription_stabilized = (
-            on_realtime_transcription_stabilized
-        )
         self.handle_buffer_overflow = handle_buffer_overflow
         self.allowed_latency_limit = allowed_latency_limit
 
@@ -493,12 +449,9 @@ class AudioToTextRecorder:
         self.state = "inactive"
         self.wakeword_detected = False
         self.text_storage = []
-        self.realtime_stabilized_text = ""
-        self.realtime_stabilized_safetext = ""
         self.is_webrtc_speech_active = False
         self.is_silero_speech_active = False
         self.recording_thread = None
-        self.realtime_thread = None
         self.audio_interface = None
         self.audio = None
         self.stream = None
@@ -508,9 +461,6 @@ class AudioToTextRecorder:
         self.backdate_resume_seconds = 0.0
         self.last_transcription_bytes = None
         self.last_transcription_bytes_b64 = None
-        self.initial_prompt = initial_prompt
-        self.initial_prompt_realtime = initial_prompt_realtime
-        self.suppress_tokens = suppress_tokens
         self.use_wake_words = wake_words or wakeword_backend in {'oww', 'openwakeword', 'openwakewords'}
         self.transcription_lock = threading.Lock()
         self.shutdown_lock = threading.Lock()
@@ -539,7 +489,7 @@ class AudioToTextRecorder:
         # Add the handlers to the logger
         if not no_log_file:
             # Create a file handler and set its level
-            file_handler = logging.FileHandler('realtimesst.log')
+            file_handler = logging.FileHandler('realtimestt.log')
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(logging.Formatter(
                 file_log_format,
@@ -732,11 +682,6 @@ class AudioToTextRecorder:
         self.recording_thread = threading.Thread(target=self._recording_worker)
         self.recording_thread.daemon = True
         self.recording_thread.start()
-
-        # Start the realtime transcription worker thread
-        self.realtime_thread = threading.Thread(target=self._realtime_worker)
-        self.realtime_thread.daemon = True
-        self.realtime_thread.start()
                    
         # Wait for transcription models to start
         logging.debug('Waiting for main transcription model to start')
@@ -1265,7 +1210,6 @@ class AudioToTextRecorder:
         audio_copy = copy.deepcopy(self.audio)
         start_time = 0
         with self.transcription_lock:
-            
             try:
                 if self.transcribe_count == 0:
                     logging.debug("Adding transcription request, no early transcription started")
@@ -1574,10 +1518,6 @@ class AudioToTextRecorder:
 
             self.parent_transcription_pipe.close()
 
-            logging.debug('Finishing realtime thread')
-            if self.realtime_thread:
-                self.realtime_thread.join()
-
             gc.collect()
 
     def _recording_worker(self):
@@ -1812,152 +1752,6 @@ class AudioToTextRecorder:
             if not self.interrupt_stop_event.is_set():
                 logging.error(f"Unhandled exeption in _recording_worker: {e}", exc_info=True)
                 raise
-
-    def _realtime_worker(self):
-        """
-        Performs real-time transcription if the feature is enabled.
-
-        The method is responsible transcribing recorded audio frames
-          in real-time based on the specified resolution interval.
-        The transcribed text is stored in `self.realtime_transcription_text`
-          and a callback
-        function is invoked with this text if specified.
-        """
-
-        try:
-
-            logging.debug('Starting realtime worker')
-
-            # Return immediately if real-time transcription is not enabled
-            if not self.enable_realtime_transcription:
-                return
-
-            # Continue running as long as the main process is active
-            while self.is_running:
-
-                # Check if the recording is active
-                if self.is_recording:
-
-                    # Sleep for the duration of the transcription resolution
-                    time.sleep(self.realtime_processing_pause)
-
-                    # Convert the buffer frames to a NumPy array
-                    audio_array = np.frombuffer(
-                        b''.join(self.frames),
-                        dtype=np.int16
-                        )
-
-                    logging.debug(f"Current realtime buffer size: {len(audio_array)}")
-
-                    # Normalize the array to a [-1, 1] range
-                    audio_array = audio_array.astype(np.float32) / \
-                        INT16_MAX_ABS_VALUE
-
-                    with self.transcription_lock:
-                        try:
-                            self.parent_transcription_pipe.send((audio_array, self.language))
-                            if self.parent_transcription_pipe.poll(timeout=5):  # Wait for 5 seconds
-                                logging.debug("Receive from realtime worker after transcription request to main model")
-                                status, result = self.parent_transcription_pipe.recv()
-                                if status == 'success':
-                                    realtime_text = result
-                                    logging.debug(f"Realtime text detected with main model: {realtime_text}")
-                                else:
-                                    logging.error(f"Realtime transcription error: {result}")
-                                    continue
-                            else:
-                                logging.warning("Realtime transcription timed out")
-                                continue
-                        except Exception as e:
-                            logging.error(f"Error in realtime transcription: {str(e)}", exc_info=True)
-                            continue
-
-                    # double check recording state
-                    # because it could have changed mid-transcription
-                    if self.is_recording and time.time() - \
-                            self.recording_start_time > self.init_realtime_after_seconds:
-
-                        self.realtime_transcription_text = realtime_text
-                        self.realtime_transcription_text = \
-                            self.realtime_transcription_text.strip()
-
-                        self.text_storage.append(
-                            self.realtime_transcription_text
-                            )
-
-                        # Take the last two texts in storage, if they exist
-                        if len(self.text_storage) >= 2:
-                            last_two_texts = self.text_storage[-2:]
-
-                            # Find the longest common prefix
-                            # between the two texts
-                            prefix = os.path.commonprefix(
-                                [last_two_texts[0], last_two_texts[1]]
-                                )
-
-                            # This prefix is the text that was transcripted
-                            # two times in the same way
-                            # Store as "safely detected text"
-                            if len(prefix) >= \
-                                    len(self.realtime_stabilized_safetext):
-
-                                # Only store when longer than the previous
-                                # as additional security
-                                self.realtime_stabilized_safetext = prefix
-
-                        # Find parts of the stabilized text
-                        # in the freshly transcripted text
-                        matching_pos = self._find_tail_match_in_text(
-                            self.realtime_stabilized_safetext,
-                            self.realtime_transcription_text
-                            )
-
-                        if matching_pos < 0:
-                            if self.realtime_stabilized_safetext:
-                                self._on_realtime_transcription_stabilized(
-                                    self._preprocess_output(
-                                        self.realtime_stabilized_safetext,
-                                        True
-                                    )
-                                )
-                            else:
-                                self._on_realtime_transcription_stabilized(
-                                    self._preprocess_output(
-                                        self.realtime_transcription_text,
-                                        True
-                                    )
-                                )
-                        else:
-                            # We found parts of the stabilized text
-                            # in the transcripted text
-                            # We now take the stabilized text
-                            # and add only the freshly transcripted part to it
-                            output_text = self.realtime_stabilized_safetext + \
-                                self.realtime_transcription_text[matching_pos:]
-
-                            # This yields us the "left" text part as stabilized
-                            # AND at the same time delivers fresh detected
-                            # parts on the first run without the need for
-                            # two transcriptions
-                            self._on_realtime_transcription_stabilized(
-                                self._preprocess_output(output_text, True)
-                                )
-
-                        # Invoke the callback with the transcribed text
-                        self._on_realtime_transcription_update(
-                            self._preprocess_output(
-                                self.realtime_transcription_text,
-                                True
-                            )
-                        )
-
-                # If not recording, sleep briefly before checking again
-                else:
-                    time.sleep(TIME_SLEEP)
-
-        except Exception as e:
-            logging.error(f"Unhandled exeption in _realtime_worker: {e}", exc_info=True)
-            raise
 
     def _is_silero_speech(self, chunk):
         """
@@ -2211,43 +2005,6 @@ class AudioToTextRecorder:
                 return len(text2) - i
 
         return -1
-
-    def _on_realtime_transcription_stabilized(self, text):
-        """
-        Callback method invoked when the real-time transcription stabilizes.
-
-        This method is called internally when the transcription text is
-        considered "stable" meaning it's less likely to change significantly
-        with additional audio input. It notifies any registered external
-        listener about the stabilized text if recording is still ongoing.
-        This is particularly useful for applications that need to display
-        live transcription results to users and want to highlight parts of the
-        transcription that are less likely to change.
-
-        Args:
-            text (str): The stabilized transcription text.
-        """
-        if self.on_realtime_transcription_stabilized:
-            if self.is_recording:
-                self.on_realtime_transcription_stabilized(text)
-
-    def _on_realtime_transcription_update(self, text):
-        """
-        Callback method invoked when there's an update in the real-time
-        transcription.
-
-        This method is called internally whenever there's a change in the
-        transcription text, notifying any registered external listener about
-        the update if recording is still ongoing. This provides a mechanism
-        for applications to receive and possibly display live transcription
-        updates, which could be partial and still subject to change.
-
-        Args:
-            text (str): The updated transcription text.
-        """
-        if self.on_realtime_transcription_update:
-            if self.is_recording:
-                self.on_realtime_transcription_update(text)
 
     def __enter__(self):
         """
