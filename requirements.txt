@@ -1,0 +1,11 @@
+PyAudio==0.2.14
+pvporcupine==1.9.5
+webrtcvad-wheels==2.0.14
+halo==0.0.31
+torch
+torchaudio
+scipy==1.15.1
+openwakeword>=0.4.0
+numpy
+soundfile==0.13.1
+silero_vad==5.1.2
