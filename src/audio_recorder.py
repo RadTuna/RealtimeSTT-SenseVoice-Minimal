@@ -61,8 +61,6 @@ import gc
 # Set OpenMP runtime duplicate library handling to OK (Use only for development!)
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-INIT_REALTIME_PROCESSING_PAUSE = 0.2
-INIT_REALTIME_INITIAL_PAUSE = 0.2
 INIT_SILERO_SENSITIVITY = 0.4
 INIT_WEBRTC_SENSITIVITY = 3
 INIT_POST_SPEECH_SILENCE_DURATION = 0.6
@@ -104,14 +102,20 @@ class TranscriptionWorker:
 
     def poll_connection(self):
         while not self.shutdown_event.is_set():
-            if self.conn.poll(0.01):
-                try:
-                    data = self.conn.recv()
-                    self.queue.put(data)
-                except Exception as e:
-                    logging.error(f"Error receiving data from connection: {e}", exc_info=True)
-            else:
-                time.sleep(TIME_SLEEP)
+            try:
+                if self.conn.poll(0.01):
+                    try:
+                        data = self.conn.recv()
+                        self.queue.put(data)
+                    except Exception as e:
+                        logging.error(f"Error receiving data from connection: {e}", exc_info=True)
+                else:
+                    time.sleep(TIME_SLEEP)
+            except Exception as e:
+                logging.error(f"Error in poll_connection: {e}", exc_info=True)
+                break;
+    
+        self.conn.close()
 
     def run(self):
         if __name__ == "__main__":
