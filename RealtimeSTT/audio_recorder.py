@@ -57,6 +57,7 @@ import copy
 import os
 import re
 import gc
+import psutil
 
 # Set OpenMP runtime duplicate library handling to OK (Use only for development!)
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -83,6 +84,12 @@ if platform.system() != 'Darwin':
     INIT_HANDLE_BUFFER_OVERFLOW = True
 
 
+def check_parent_process(shutdown_event):
+    ppid = os.getppid()
+    if not psutil.pid_exists(ppid) and not shutdown_event.is_set():
+        shutdown_event.set()
+
+
 class TranscriptionWorker:
     def __init__(self, conn, stdout_pipe, model_path, ready_event, shutdown_event, interrupt_stop_event):
         self.conn = conn
@@ -102,6 +109,8 @@ class TranscriptionWorker:
 
     def poll_connection(self):
         while not self.shutdown_event.is_set():
+            check_parent_process(self.shutdown_event)
+
             try:
                 if self.conn.poll(0.01):
                     try:
@@ -146,6 +155,8 @@ class TranscriptionWorker:
 
         try:
             while not self.shutdown_event.is_set():
+                check_parent_process(self.shutdown_event)
+
                 try:
                     audio, language = self.queue.get(timeout=0.1)
                     try:
@@ -247,7 +258,7 @@ class AudioToTextRecorder:
                  print_transcription_time: bool = False,
                  early_transcription_on_silence: int = 0,
                  allowed_latency_limit: int = ALLOWED_LATENCY_LIMIT,
-                 no_log_file: bool = False,
+                 no_log_file: bool = True,
                  ):
         """
         Initializes an audio recorder and  transcription
@@ -717,12 +728,14 @@ class AudioToTextRecorder:
             thread.start()
             return thread
         else:
-            thread = mp.Process(target=target, args=args)
+            thread = mp.Process(target=target, args=args, daemon=True)
             thread.start()
             return thread
 
     def _read_stdout(self):
         while not self.shutdown_event.is_set():
+            check_parent_process(self.shutdown_event)
+
             try:
                 if self.parent_stdout_pipe.poll(0.1):
                     logging.debug("Receive from stdout pipe")
@@ -836,6 +849,8 @@ class AudioToTextRecorder:
 
             """Initialize the audio stream with error handling."""
             while not shutdown_event.is_set():
+                check_parent_process(shutdown_event)
+
                 try:
                     # First, get a list of all available input devices
                     input_devices = []
@@ -971,6 +986,8 @@ class AudioToTextRecorder:
 
         try:
             while not shutdown_event.is_set():
+                check_parent_process(shutdown_event)
+
                 try:
                     data = stream.read(chunk_size, exception_on_overflow=False)
                     
